@@ -1,0 +1,4 @@
+# NCD.jl gitignore
+*.ncd
+*.tmp
+.DS_Store
