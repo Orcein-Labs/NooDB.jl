@@ -9,13 +9,19 @@ include("lorentz.jl")
 include("clifford.jl")
 include("trie.jl")
 include("format.jl")
+include("platform.jl")
+include("serialization.jl")
 include("engine.jl")
+include("server.jl")
 
 using .Lorentz
 using .Clifford
 using .Trie
 using .Format
+using .Platform
+using .SecureSerialization
 using .Engine
+using .Server
 
 import Base: put!, get, delete!
 
@@ -37,11 +43,18 @@ export NooDBHeader, NCDHeader,
        NOODB_MAGIC, NCD_MAGIC, NOODB_VERSION, NCD_VERSION,
        write_header, read_header, append_payload, read_payload
 
+# Export Platform & Security Primitives
+export DatabaseLockedException, acquire_file_lock, release_file_lock, hard_sync,
+       serialize_value, deserialize_value
+
 # Export Engine & High-Level Database API
 export NooDBDatabase, NCDDatabase, SearchResult,
        open_database, close_database, sync!, compact!, vacuum!,
-       put!, get, delete!, near, query_latent,
+       transaction, put!, get, delete!, near, query_latent,
        rotor_between, apply_rotor
+
+# Export HTTP/REST Server Daemon
+export NooDBServer, start_server, stop_server
 
 # Convenience aliases matching idiomatic Julia API
 Base.open(::Type{NooDBDatabase}, path::String; kwargs...) = open_database(path; kwargs...)

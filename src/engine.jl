@@ -10,13 +10,16 @@ using ..Lorentz
 using ..Clifford
 using ..Trie
 using ..Format
+using ..Platform
+using ..SecureSerialization
 
 import ..Clifford: rotor_between, apply_rotor
 import Base: put!, get, delete!
 
-export NooDBDatabase, NCDDatabase, SearchResult,
+export NooDBDatabase, NCDDatabase, SearchResult, DatabaseLockedException,
        open_database, close_database, put!, get, delete!,
-       near, query_latent, rotor_between, apply_rotor, sync!, compact!, vacuum!
+       near, query_latent, rotor_between, apply_rotor, sync!, compact!, vacuum!,
+       transaction
 
 """
     SearchResult
@@ -55,98 +58,116 @@ end
 const NCDDatabase = NooDBDatabase
 
 """
-    open_database(path::String; create::Bool=false, scale_depth::Int=4, codebook_sizes::Vector{Int}=[16, 16, 16, 16])::NooDBDatabase
+    open_database(path::String; create::Bool=false, scale_depth::Int=4, codebook_sizes::Vector{Int}=[16, 16, 16, 16], lock_file::Bool=true)::NooDBDatabase
 
-Opens an existing NooDB database or creates a new one with double-buffered headers.
+Opens an existing NooDB database or creates a new one with double-buffered headers and cross-process advisory lock.
 """
 function open_database(
     path::String;
     create::Bool = false,
     scale_depth::Int = 4,
-    codebook_sizes::Vector{Int} = [16, 16, 16, 16]
+    codebook_sizes::Vector{Int} = [16, 16, 16, 16],
+    lock_file::Bool = true
 )::NooDBDatabase
     if !isfile(path)
         if !create
             error("NooDB file not found at '$path' and create=false")
         end
         io = Base.open(path, "w+")
-        
-        # Initialize synthetic anchor centroids for codebooks at each scale
-        codebooks = Vector{Vector{LorentzPoint}}(undef, scale_depth)
-        for s in 1:scale_depth
-            sz = (s <= length(codebook_sizes)) ? codebook_sizes[s] : 16
-            cb = Vector{LorentzPoint}(undef, sz)
-            for i in 1:sz
-                sp = ntuple(d -> Float32(sin(Float32(i * 1.7f0 + d * 0.9f0) + Float32(s)) * 0.5f0 / Float32(s)), 5)
-                cb[i] = LorentzPoint(sp)
+        try
+            if lock_file
+                acquire_file_lock(io, path; exclusive=true)
             end
-            codebooks[s] = cb
-        end
-        
-        # Root node at index 1
-        root_point = LorentzPoint((0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0))
-        root_node = create_node(0, 0, root_point; radius=100.0f0, flags=0)
-        nodes = [root_node]
-        children = Dict{Int, Vector{Int}}(1 => Int[])
-        
-        # Header setup: Generation 1 in Slot A (offset 0), pad initial file to HEADER_BLOCK_SIZE
-        seek(io, 0)
-        write(io, zeros(UInt8, HEADER_BLOCK_SIZE))
-        
-        header = NooDBHeader(
-            NOODB_MAGIC, NOODB_VERSION, 0x0, UInt64(1), UInt32(0),
-            UInt16(scale_depth), UInt16(5),
-            UInt32(1), UInt64(0),
-            UInt64(HEADER_BLOCK_SIZE), UInt64(0), UInt64(0), UInt64(0), UInt64(HEADER_BLOCK_SIZE)
-        )
-        write_header(io, header)
-        
-        db = NooDBDatabase(path, io, header, codebooks, nodes, children, Dict{String, Int}(), Dict{Int, String}(), true, UInt64(1), ReentrantLock())
-        sync!(db)
-        return db
-    else
-        io = Base.open(path, "r+")
-        header = read_header(io)
-        gen = header.generation
-        
-        # Restore codebooks, trie nodes, and key directory from disk
-        codebooks = read_codebooks(io, header.offset_codebooks)
-        if isempty(codebooks)
-            codebooks = Vector{Vector{LorentzPoint}}(undef, Int(header.scale_depth_k))
-            for s in 1:Int(header.scale_depth_k)
-                cb = Vector{LorentzPoint}(undef, 16)
-                for i in 1:16
+            
+            # Initialize synthetic anchor centroids for codebooks at each scale
+            codebooks = Vector{Vector{LorentzPoint}}(undef, scale_depth)
+            for s in 1:scale_depth
+                sz = (s <= length(codebook_sizes)) ? codebook_sizes[s] : 16
+                cb = Vector{LorentzPoint}(undef, sz)
+                for i in 1:sz
                     sp = ntuple(d -> Float32(sin(Float32(i * 1.7f0 + d * 0.9f0) + Float32(s)) * 0.5f0 / Float32(s)), 5)
                     cb[i] = LorentzPoint(sp)
                 end
                 codebooks[s] = cb
             end
-        end
-        
-        nodes, children = read_trie_nodes(io, header.offset_trie)
-        if isempty(nodes)
+            
+            # Root node at index 1
             root_point = LorentzPoint((0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0))
             root_node = create_node(0, 0, root_point; radius=100.0f0, flags=0)
             nodes = [root_node]
             children = Dict{Int, Vector{Int}}(1 => Int[])
+            
+            # Header setup: Generation 1 in Slot A (offset 0), pad initial file to HEADER_BLOCK_SIZE
+            seek(io, 0)
+            write(io, zeros(UInt8, HEADER_BLOCK_SIZE))
+            
+            header = NooDBHeader(
+                NOODB_MAGIC, NOODB_VERSION, 0x0, UInt64(1), UInt32(0),
+                UInt16(scale_depth), UInt16(5),
+                UInt32(1), UInt64(0),
+                UInt64(0), UInt64(0), UInt64(0), UInt64(0), UInt64(HEADER_BLOCK_SIZE)
+            )
+            write_header(io, header)
+            
+            db = NooDBDatabase(path, io, header, codebooks, nodes, children, Dict{String, Int}(), Dict{Int, String}(), true, UInt64(1), ReentrantLock())
+            sync!(db)
+            return db
+        catch e
+            Base.close(io)
+            rethrow(e)
         end
-        
-        key_to_node = read_key_directory(io, header.offset_keys)
-        node_to_key = Dict{Int, String}(v => k for (k, v) in key_to_node)
-        
-        return NooDBDatabase(path, io, header, codebooks, nodes, children, key_to_node, node_to_key, false, gen, ReentrantLock())
+    else
+        io = Base.open(path, "r+")
+        try
+            if lock_file
+                acquire_file_lock(io, path; exclusive=true)
+            end
+            header = read_header(io)
+            gen = header.generation
+            
+            # Restore codebooks, trie nodes, and key directory from disk
+            codebooks = read_codebooks(io, header.offset_codebooks)
+            if isempty(codebooks)
+                codebooks = Vector{Vector{LorentzPoint}}(undef, Int(header.scale_depth_k))
+                for s in 1:Int(header.scale_depth_k)
+                    cb = Vector{LorentzPoint}(undef, 16)
+                    for i in 1:16
+                        sp = ntuple(d -> Float32(sin(Float32(i * 1.7f0 + d * 0.9f0) + Float32(s)) * 0.5f0 / Float32(s)), 5)
+                        cb[i] = LorentzPoint(sp)
+                    end
+                    codebooks[s] = cb
+                end
+            end
+            
+            nodes, children = read_trie_nodes(io, header.offset_trie)
+            if isempty(nodes)
+                root_point = LorentzPoint((0.0f0, 0.0f0, 0.0f0, 0.0f0, 0.0f0))
+                root_node = create_node(0, 0, root_point; radius=100.0f0, flags=0)
+                nodes = [root_node]
+                children = Dict{Int, Vector{Int}}(1 => Int[])
+            end
+            
+            key_to_node = read_key_directory(io, header.offset_keys)
+            node_to_key = Dict{Int, String}(v => k for (k, v) in key_to_node)
+            
+            return NooDBDatabase(path, io, header, codebooks, nodes, children, key_to_node, node_to_key, false, gen, ReentrantLock())
+        catch e
+            Base.close(io)
+            rethrow(e)
+        end
     end
 end
 
 """
     close_database(db::NooDBDatabase)
 
-Flushes pending writes, serializes index tables, updates header, and closes the file stream.
+Flushes pending writes, releases advisory lock, and closes the file stream.
 """
 function close_database(db::NooDBDatabase)
     lock(db.lock) do
         if isopen(db.io)
             sync!(db)
+            release_file_lock(db.io)
             Base.close(db.io)
         end
     end
@@ -155,13 +176,17 @@ end
 """
     sync!(db::NooDBDatabase)
 
-Persists codebooks, trie nodes, key directory, and double-buffered header to disk.
+Persists codebooks, trie nodes, key directory, and double-buffered header to disk with fdatasync.
 """
 function sync!(db::NooDBDatabase)
     lock(db.lock) do
         if isopen(db.io)
-            # 1. Write codebooks
-            off_cb = write_codebooks(db.io, db.codebooks)
+            if !db.dirty
+                return db
+            end
+            
+            # 1. Codebooks are immutable after creation. Only write if not yet written
+            off_cb = db.header.offset_codebooks > 0 ? db.header.offset_codebooks : write_codebooks(db.io, db.codebooks)
             
             # 2. Write trie nodes and children adjacency
             off_trie = write_trie_nodes(db.io, db.nodes, db.children)
@@ -186,8 +211,25 @@ function sync!(db::NooDBDatabase)
             db.header = new_header
             write_header(db.io, db.header)
             flush(db.io)
+            hard_sync(db.io)
             db.dirty = false
         end
+    end
+    return db
+end
+
+"""
+    transaction(f::Function, db::NooDBDatabase)
+
+Executes a batch of operations inside an atomic transaction block.
+Suppresses intermediate sync overhead and issues a single hardware-synchronized
+commit barrier upon block completion.
+"""
+function transaction(f::Function, db::NooDBDatabase)
+    lock(db.lock) do
+        res = f()
+        sync!(db)
+        return res
     end
 end
 
@@ -195,17 +237,14 @@ end
     serialize_value(val)::Vector{UInt8}
 """
 function serialize_value(val)::Vector{UInt8}
-    io = IOBuffer()
-    serialize(io, val)
-    return take!(io)
+    return SecureSerialization.serialize_value(val)
 end
 
 """
     deserialize_value(bytes::Vector{UInt8})::Any
 """
 function deserialize_value(bytes::Vector{UInt8})::Any
-    io = IOBuffer(bytes)
-    return deserialize(io)
+    return SecureSerialization.deserialize_value(bytes)
 end
 
 """
@@ -468,14 +507,17 @@ function compact!(db::NooDBDatabase)
         )
         write_header(tmp_io, new_header)
         flush(tmp_io)
+        hard_sync(tmp_io)
         Base.close(tmp_io)
         
         # Close old file stream, atomically swap, and reopen
+        release_file_lock(db.io)
         Base.close(db.io)
         mv(tmp_path, db.path; force=true)
         
         # Reopen and re-bind handle
         db.io = Base.open(db.path, "r+")
+        acquire_file_lock(db.io, db.path; exclusive=true)
         db.header = new_header
         db.nodes = new_nodes
         db.generation = new_gen
@@ -549,20 +591,23 @@ function near(
     db::NooDBDatabase,
     query;
     limit::Int = 5,
+    k::Union{Nothing, Int} = nothing,
     mode::Symbol = :exact
 )::Vector{SearchResult}
+    actual_limit = k !== nothing ? k : limit
     t_start = time_ns()
     
     q_pt = if query isa LorentzPoint
         query
     elseif query isa AbstractVector
         project_highdim_to_h5(query)
-    elseif query isa String
+    elseif query isa AbstractString
+        q_str = String(query)
         lock(db.lock) do
-            if haskey(db.key_to_node, query)
-                get_lorentz_point(db.nodes[db.key_to_node[query]])
+            if haskey(db.key_to_node, q_str)
+                get_lorentz_point(db.nodes[db.key_to_node[q_str]])
             else
-                compute_concept_coords(query, query, nothing)
+                compute_concept_coords(q_str, q_str, nothing)
             end
         end
     else
@@ -571,9 +616,9 @@ function near(
 
     lock(db.lock) do
         if mode == :reflex
-            return near_reflex(db, q_pt, limit, t_start)
+            return near_reflex(db, q_pt, actual_limit, t_start)
         else
-            return near_exact(db, q_pt, limit, t_start)
+            return near_exact(db, q_pt, actual_limit, t_start)
         end
     end
 end
@@ -736,9 +781,10 @@ end
 """
     query_latent(db::NooDBDatabase, z::AbstractVector; limit=1, mode=:exact)
 """
-function query_latent(db::NooDBDatabase, z::AbstractVector; limit::Int = 1, mode::Symbol = :exact)
+function query_latent(db::NooDBDatabase, z::AbstractVector; limit::Int = 1, k::Union{Nothing, Int} = nothing, mode::Symbol = :exact)
+    actual_limit = k !== nothing ? k : limit
     q_pt = project_highdim_to_h5(z)
-    return near(db, q_pt; limit=limit, mode=mode)
+    return near(db, q_pt; limit=actual_limit, mode=mode)
 end
 
 """

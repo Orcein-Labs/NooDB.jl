@@ -37,8 +37,9 @@ println("=======================================================================
             end
             """
             
+            proj_dir = dirname(@__DIR__)
             # Launch background worker process
-            proc = run(pipeline(`julia --project=. -e $worker_code`), wait=false)
+            proc = run(pipeline(`julia --project=$proj_dir -e $worker_code`), wait=false)
             
             # Wait until file is actively created and has flushed at least one synced generation
             t_wait_start = time()

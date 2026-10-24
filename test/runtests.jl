@@ -202,4 +202,6 @@ using CRC32c
         end
     end
 
+    include("production_hardening_tests.jl")
+
 end

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# NooDB CLI Launcher
+# Usage:
+#   noodb serve [--host 127.0.0.1] [--port 8080] <db_path>
+#   noodb stats <db_path>
+#   noodb compact <db_path>
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec julia --project="$DIR" -e '
+using NooDB
+
+args = ARGS
+if isempty(args)
+    println("NooDB CLI v0.1.0 - Knowledge Has Geometry")
+    println("Usage:")
+    println("  noodb serve [--host 127.0.0.1] [--port 8080] <db_path>")
+    println("  noodb stats <db_path>")
+    println("  noodb compact <db_path>")
+    exit(0)
+end
+
+cmd = args[1]
+if cmd == "serve"
+    host = "127.0.0.1"
+    port = 8080
+    db_path = "data.noo"
+    i = 2
+    while i <= length(args)
+        if args[i] == "--host" && i < length(args)
+            host = args[i+1]
+            i += 2
+        elseif args[i] == "--port" && i < length(args)
+            port = parse(Int, args[i+1])
+            i += 2
+        else
+            db_path = args[i]
+            i += 1
+        end
+    end
+    println("⚡ Starting NooDB daemon on $host:$port (database: $db_path)...")
+    srv = start_server(db_path; host=host, port=port, async=false)
+elseif cmd == "stats"
+    if length(args) < 2
+        println("Error: db_path required")
+        exit(1)
+    end
+    db = open_database(args[2])
+    println("Database: ", args[2])
+    println("Active Records: ", length(db.key_to_node))
+    println("Total Trie Nodes: ", length(db.nodes))
+    println("Commit Generation: ", db.generation)
+    println("File Size: ", filesize(db.io), " bytes")
+    close_database(db)
+elseif cmd == "compact"
+    if length(args) < 2
+        println("Error: db_path required")
+        exit(1)
+    end
+    println("Compacting and vacuuming ", args[2], "...")
+    db = open_database(args[2])
+    sz_before = filesize(db.io)
+    compact!(db)
+    sz_after = filesize(db.io)
+    close_database(db)
+    println("Compacted: $sz_before -> $sz_after bytes (-$(((sz_before - sz_after)/sz_before)*100)%)")
+else
+    println("Unknown command: $cmd")
+    exit(1)
+end
+' "$@"

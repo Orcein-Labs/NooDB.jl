@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-24T02:14:05Z",
+  "timestamp": "2026-10-24T03:24:04Z",
   "system": {
     "os": "Linux",
     "cpu": "x86_64",
@@ -8,47 +8,47 @@
   "key_value_benchmarks": {
     "records": 5000,
     "noodb": {
-      "write_throughput_ops_per_sec": 36150.1,
-      "read_p50_us": 6.69,
-      "read_p95_us": 10.31,
-      "read_p99_us": 36.86,
-      "file_size_kb": 910.4
+      "write_throughput_ops_per_sec": 70261.5,
+      "read_p50_us": 4.91,
+      "read_p95_us": 10.83,
+      "read_p99_us": 16.74,
+      "file_size_kb": 879.6
     },
     "sqlite_wal": {
-      "write_throughput_ops_per_sec": 279266.5,
-      "read_p50_us": 6.10,
-      "read_p95_us": 7.32,
-      "read_p99_us": 12.67,
+      "write_throughput_ops_per_sec": 135463.6,
+      "read_p50_us": 13.20,
+      "read_p95_us": 14.47,
+      "read_p99_us": 26.81,
       "file_size_kb": 4.0
     }
   },
   "vector_benchmarks": [
     {
       "n_records": 500,
-      "brute_force_us": 13.78,
-      "noodb_exact_bb_us": 2006.51,
-      "noodb_reflex_us": 624.25,
-      "pruned_ratio_pct": 63.2
+      "brute_force_us": 14.00,
+      "noodb_exact_bb_us": 153.89,
+      "noodb_reflex_us": 755.40,
+      "pruned_ratio_pct": 61.5
     },
     {
       "n_records": 1000,
-      "brute_force_us": 28.50,
-      "noodb_exact_bb_us": 164.76,
-      "noodb_reflex_us": 1533.28,
-      "pruned_ratio_pct": 79.7
+      "brute_force_us": 29.34,
+      "noodb_exact_bb_us": 133.22,
+      "noodb_reflex_us": 1030.86,
+      "pruned_ratio_pct": 78.6
     },
     {
       "n_records": 2500,
-      "brute_force_us": 71.95,
-      "noodb_exact_bb_us": 498.98,
-      "noodb_reflex_us": 4466.65,
-      "pruned_ratio_pct": 90.9
+      "brute_force_us": 61.38,
+      "noodb_exact_bb_us": 264.89,
+      "noodb_reflex_us": 2956.43,
+      "pruned_ratio_pct": 90.5
     },
     {
       "n_records": 5000,
-      "brute_force_us": 144.40,
-      "noodb_exact_bb_us": 756.98,
-      "noodb_reflex_us": 9085.56,
+      "brute_force_us": 131.49,
+      "noodb_exact_bb_us": 508.86,
+      "noodb_reflex_us": 6189.05,
       "pruned_ratio_pct": 95.1
     }
   ],

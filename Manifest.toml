@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "6e26a55cf3d06f9e9d4bacc12bd8f6f90282d239"
+project_hash = "0bd7274ff08c8b605f6abf77f5e39c743e098b8d"
 
 [[deps.Artifacts]]
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
@@ -31,7 +31,7 @@ uuid = "a63ad114-7e13-5084-954f-fe012c677804"
 version = "1.11.0"
 
 [[deps.NCD]]
-deps = ["CRC32c", "LinearAlgebra", "Mmap", "Serialization"]
+deps = ["CRC32c", "LinearAlgebra", "Mmap", "Serialization", "Sockets"]
 path = "."
 uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 version = "0.1.0"
@@ -43,6 +43,10 @@ version = "0.3.29+0"
 
 [[deps.Serialization]]
 uuid = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+version = "1.11.0"
+
+[[deps.Sockets]]
+uuid = "6462fe0b-24de-5631-8697-dd941f90decc"
 version = "1.11.0"
 
 [[deps.libblastrampoline_jll]]
