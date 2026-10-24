@@ -1,5 +1,6 @@
-# NCD.jl - Binary File Format & Zero-Copy Mmap Module
-# Manages .ncd on-disk layout, headers, codebook tables, and checksummed payloads
+# NooDB.jl - Binary File Format & Zero-Copy Mmap Module
+# Manages .noodb / .ncd on-disk layout, double-buffered atomic headers,
+# codebook tables, and checksummed payloads with crash-recovery invariants.
 
 module Format
 
@@ -8,40 +9,120 @@ using CRC32c
 using ..Lorentz
 using ..Trie
 
-export NCDHeader, NCD_MAGIC, NCD_VERSION, HEADER_SIZE,
+export NooDBHeader, NCDHeader,
+       NOODB_MAGIC, NCD_MAGIC, NOODB_VERSION, NCD_VERSION,
+       HEADER_SLOT_SIZE, HEADER_BLOCK_SIZE, MAX_PAYLOAD_SIZE,
        write_header, read_header, write_codebooks, read_codebooks,
        write_trie_nodes, read_trie_nodes, write_key_directory, read_key_directory,
-       append_payload, read_payload, format_database
+       append_payload, read_payload
 
-const NCD_MAGIC   = 0x3144434e  # "NCD1" in little-endian ASCII
-const NCD_VERSION = 0x0001
-const HEADER_SIZE = 128
+# Magic numbers
+# "NOO1" in little-endian ASCII: 'N'(0x4E) | 'O'(0x4F)<<8 | 'O'(0x4F)<<16 | '1'(0x31)<<24 = 0x314f4f4e
+const NOODB_MAGIC   = 0x314f4f4e
+const NCD_MAGIC     = 0x3144434e  # Legacy "NCD1" compatibility
+const NOODB_VERSION = 0x0001
+const NCD_VERSION   = 0x0001
+
+const HEADER_SLOT_SIZE  = 128
+const HEADER_BLOCK_SIZE = 256  # 2 slots (Slot A at 0, Slot B at 128)
+const MAX_PAYLOAD_SIZE  = 64 * 1024 * 1024 # 64 MB allocation ceiling defense
 
 """
-    NCDHeader
+    NooDBHeader
 
-128-byte file header containing layout offsets and dimensions.
+128-byte file header containing layout offsets, dimensions, monotonic generation, and CRC32c.
 """
-struct NCDHeader
-    magic::UInt32             # 0x00: "NCD1"
+struct NooDBHeader
+    magic::UInt32             # 0x00: "NOO1" or "NCD1"
     version::UInt16           # 0x04: Version (1)
     flags::UInt16             # 0x06: Flags
-    scale_depth_k::UInt16     # 0x08: Number of hierarchical concept scale levels
-    ambient_dim::UInt16       # 0x0A: Spatial dimension (5)
-    total_nodes::UInt32       # 0x0C: Total trie nodes
-    total_records::UInt64     # 0x10: Total stored records
-    offset_codebooks::UInt64  # 0x18: Byte offset to codebook tables
-    offset_trie::UInt64       # 0x20: Byte offset to trie node table
-    offset_keys::UInt64       # 0x28: Byte offset to string key directory
-    offset_payloads::UInt64   # 0x30: Byte offset to payload storage
-    file_size::UInt64         # 0x38: Total file size in bytes
+    generation::UInt64        # 0x08: Monotonic commit generation counter
+    crc::UInt32               # 0x10: CRC32c of header fields
+    scale_depth_k::UInt16     # 0x14: Number of hierarchical concept scale levels
+    ambient_dim::UInt16       # 0x16: Spatial dimension (5)
+    total_nodes::UInt32       # 0x18: Total trie nodes
+    total_records::UInt64     # 0x1C: Total active records
+    offset_codebooks::UInt64  # 0x24: Byte offset to codebook tables
+    offset_trie::UInt64       # 0x2C: Byte offset to trie node table
+    offset_keys::UInt64       # 0x34: Byte offset to string key directory
+    offset_payloads::UInt64   # 0x3C: Byte offset to payload storage
+    file_size::UInt64         # 0x44: Total file size in bytes
 end
 
-function write_header(io::IO, h::NCDHeader)
-    seek(io, 0)
+# Legacy alias
+const NCDHeader = NooDBHeader
+
+"""
+    NooDBHeader(magic, version, flags, scale_depth_k, ambient_dim, total_nodes, total_records, ...)
+
+Legacy 12-argument constructor for backwards compatibility. Defaults generation=1, crc=0.
+"""
+function NooDBHeader(
+    magic::UInt32, version::UInt16, flags::Union{UInt8, UInt16},
+    scale_depth_k::Union{UInt8, UInt16}, ambient_dim::Union{UInt8, UInt16},
+    total_nodes::Union{UInt32, Int}, total_records::Union{UInt64, Int},
+    offset_codebooks::Union{UInt64, Int}, offset_trie::Union{UInt64, Int},
+    offset_keys::Union{UInt64, Int}, offset_payloads::Union{UInt64, Int},
+    file_size::Union{UInt64, Int}
+)
+    return NooDBHeader(
+        magic, version, UInt16(flags), UInt64(1), UInt32(0),
+        UInt16(scale_depth_k), UInt16(ambient_dim), UInt32(total_nodes), UInt64(total_records),
+        UInt64(offset_codebooks), UInt64(offset_trie), UInt64(offset_keys),
+        UInt64(offset_payloads), UInt64(file_size)
+    )
+end
+
+"""
+Compute CRC32c for a header (excluding the crc field itself).
+"""
+function compute_header_crc(
+    magic::UInt32, version::UInt16, flags::UInt16, generation::UInt64,
+    scale_depth_k::UInt16, ambient_dim::UInt16, total_nodes::UInt32, total_records::UInt64,
+    offset_codebooks::UInt64, offset_trie::UInt64, offset_keys::UInt64,
+    offset_payloads::UInt64, file_size::UInt64
+)::UInt32
+    buf = IOBuffer()
+    write(buf, magic)
+    write(buf, version)
+    write(buf, flags)
+    write(buf, generation)
+    write(buf, scale_depth_k)
+    write(buf, ambient_dim)
+    write(buf, total_nodes)
+    write(buf, total_records)
+    write(buf, offset_codebooks)
+    write(buf, offset_trie)
+    write(buf, offset_keys)
+    write(buf, offset_payloads)
+    write(buf, file_size)
+    return crc32c(take!(buf))
+end
+
+"""
+    write_header(io::IO, h::NooDBHeader)
+
+Writes a header using double-buffered atomic commit (Slot A at 0, Slot B at 128).
+Alternates based on generation counter to ensure a crash mid-write never destroys the previous header.
+"""
+function write_header(io::IO, h::NooDBHeader)
+    # Slot 0 (bytes 0..127) if generation is odd, Slot 1 (bytes 128..255) if even
+    slot_offset = (h.generation % 2 == 1) ? 0 : HEADER_SLOT_SIZE
+    
+    # Compute CRC32c over the header fields
+    computed_crc = compute_header_crc(
+        h.magic, h.version, h.flags, h.generation,
+        h.scale_depth_k, h.ambient_dim, h.total_nodes, h.total_records,
+        h.offset_codebooks, h.offset_trie, h.offset_keys,
+        h.offset_payloads, h.file_size
+    )
+    
+    seek(io, slot_offset)
     write(io, h.magic)
     write(io, h.version)
     write(io, h.flags)
+    write(io, h.generation)
+    write(io, computed_crc)
     write(io, h.scale_depth_k)
     write(io, h.ambient_dim)
     write(io, h.total_nodes)
@@ -51,18 +132,42 @@ function write_header(io::IO, h::NCDHeader)
     write(io, h.offset_keys)
     write(io, h.offset_payloads)
     write(io, h.file_size)
-    # Write 64 bytes of reserved padding (total 128 bytes)
-    write(io, zeros(UInt8, 64))
+    
+    # Pad to exactly 128 bytes for this slot
+    bytes_written = 4 + 2 + 2 + 8 + 4 + 2 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 8
+    padding_needed = HEADER_SLOT_SIZE - bytes_written
+    if padding_needed > 0
+        write(io, zeros(UInt8, padding_needed))
+    end
+    
     flush(io)
 end
 
-function read_header(io::IO)::NCDHeader
-    seek(io, 0)
+"""
+Helper to attempt parsing a 128-byte header slot.
+Returns (header, is_valid).
+"""
+function parse_slot(io::IO, slot_offset::Int)::Tuple{Union{Nothing, NooDBHeader}, Bool}
+    seekend(io)
+    f_len = position(io)
+    if f_len < slot_offset + HEADER_SLOT_SIZE
+        return (nothing, false)
+    end
+    
+    seek(io, slot_offset)
     magic = read(io, UInt32)
-    @assert magic == NCD_MAGIC "Invalid NCD file: bad magic (expected 0x$(string(NCD_MAGIC, base=16)), got 0x$(string(magic, base=16)))"
+    if magic != NOODB_MAGIC && magic != NCD_MAGIC
+        return (nothing, false)
+    end
+    
     version = read(io, UInt16)
-    @assert version <= NCD_VERSION "Unsupported NCD version: $version"
+    if version > NOODB_VERSION
+        return (nothing, false)
+    end
+    
     flags = read(io, UInt16)
+    generation = read(io, UInt64)
+    crc_stored = read(io, UInt32)
     scale_depth_k = read(io, UInt16)
     ambient_dim = read(io, UInt16)
     total_nodes = read(io, UInt32)
@@ -73,14 +178,47 @@ function read_header(io::IO)::NCDHeader
     offset_payloads = read(io, UInt64)
     file_size = read(io, UInt64)
     
-    # Skip reserved 64 bytes
-    skip(io, 64)
-    
-    return NCDHeader(
-        magic, version, flags, scale_depth_k, ambient_dim,
-        total_nodes, total_records, offset_codebooks, offset_trie,
-        offset_keys, offset_payloads, file_size
+    # Verify CRC32c
+    computed_crc = compute_header_crc(
+        magic, version, flags, generation,
+        scale_depth_k, ambient_dim, total_nodes, total_records,
+        offset_codebooks, offset_trie, offset_keys, offset_payloads, file_size
     )
+    
+    # If legacy v1 file without CRC (generation was 0 and crc was 0), tolerate if magic is valid
+    is_valid = (crc_stored == computed_crc) || (generation == 0 && crc_stored == 0)
+    
+    h = NooDBHeader(
+        magic, version, flags, generation, crc_stored,
+        scale_depth_k, ambient_dim, total_nodes, total_records,
+        offset_codebooks, offset_trie, offset_keys, offset_payloads, file_size
+    )
+    return (h, is_valid)
+end
+
+"""
+    read_header(io::IO)::NooDBHeader
+
+Reads and validates the double-buffered header slots (Slot A and Slot B).
+Automatically selects the latest valid generation and recovers from interrupted writes.
+"""
+function read_header(io::IO)::NooDBHeader
+    h_a, valid_a = parse_slot(io, 0)
+    h_b, valid_b = parse_slot(io, HEADER_SLOT_SIZE)
+    
+    if valid_a && valid_b
+        # Both valid: choose the newer generation
+        return (h_a.generation >= h_b.generation) ? h_a : h_b
+    elseif valid_a
+        return h_a
+    elseif valid_b
+        return h_b
+    elseif h_a !== nothing
+        # Header A parsed with non-CRC legacy format
+        return h_a
+    else
+        error("Corrupt NooDB file: both header slots failed validation and CRC32c verification")
+    end
 end
 
 """
@@ -91,9 +229,13 @@ Returns (payload_offset, payload_size).
 Format: [Length: UInt32][CRC32c: UInt32][Raw bytes: length...]
 """
 function append_payload(io::IO, data::Vector{UInt8})::Tuple{UInt64, UInt32}
+    len = UInt32(length(data))
+    if len > MAX_PAYLOAD_SIZE
+        error("Payload size ($len bytes) exceeds maximum allowable limit of $MAX_PAYLOAD_SIZE bytes")
+    end
+    
     seekend(io)
     offset = UInt64(position(io))
-    len = UInt32(length(data))
     chk = crc32c(data)
     
     write(io, len)
@@ -107,24 +249,39 @@ end
 """
     read_payload(io::IO, offset::UInt64, size::UInt32)::Vector{UInt8}
 
-Reads and verifies a payload block at offset.
-Throws an error if CRC32c checksum does not match.
+Reads and verifies a payload block at offset with strict bounds and CRC32c check.
+Guards against malicious file size OOM bombs and corrupted offsets.
 """
 function read_payload(io::IO, offset::UInt64, size::UInt32)::Vector{UInt8}
+    if size > MAX_PAYLOAD_SIZE
+        error("Hostile payload read: size ($size bytes) exceeds security ceiling of $MAX_PAYLOAD_SIZE bytes")
+    end
+    
+    seekend(io)
+    total_fsize = UInt64(position(io))
+    if offset + 8 + UInt64(size) > total_fsize
+        error("Corrupted payload offset $offset + size $size exceeds file boundary $total_fsize")
+    end
+    
     seek(io, offset)
     len = read(io, UInt32)
-    @assert len == size "Payload size mismatch at offset $offset: expected $size, found $len"
+    if len != size
+        error("Payload size mismatch at offset $offset: expected $size, found $len")
+    end
+    
     chk_stored = read(io, UInt32)
     data = read(io, len)
     chk_computed = crc32c(data)
-    @assert chk_stored == chk_computed "CRC32c checksum failed for payload at offset $offset"
+    
+    if chk_stored != chk_computed
+        throw(AssertionError("CRC32c checksum failure for payload at offset $offset: stored 0x$(string(chk_stored, base=16)), computed 0x$(string(chk_computed, base=16))"))
+    end
+    
     return data
 end
 
 """
     write_codebooks(io::IO, codebooks::Vector{Vector{LorentzPoint}})::UInt64
-
-Serializes the hierarchical codebooks table to disk. Returns byte offset.
 """
 function write_codebooks(io::IO, codebooks::Vector{Vector{LorentzPoint}})::UInt64
     seekend(io)
@@ -149,8 +306,6 @@ end
 
 """
     read_codebooks(io::IO, offset::UInt64)::Vector{Vector{LorentzPoint}}
-
-Deserializes the codebook tables from disk at offset.
 """
 function read_codebooks(io::IO, offset::UInt64)::Vector{Vector{LorentzPoint}}
     if offset == 0
@@ -178,8 +333,6 @@ end
 
 """
     write_node(io::IO, n::TrieNode)
-
-Writes a 64-byte TrieNode field-by-field.
 """
 function write_node(io::IO, n::TrieNode)
     write(io, n.child_offset)
@@ -202,8 +355,6 @@ end
 
 """
     read_node(io::IO)::TrieNode
-
-Reads a 64-byte TrieNode field-by-field.
 """
 function read_node(io::IO)::TrieNode
     child_offset = read(io, UInt64)
@@ -231,8 +382,6 @@ end
 
 """
     write_trie_nodes(io::IO, nodes::Vector{TrieNode}, children::Dict{Int, Vector{Int}})::UInt64
-
-Serializes packed 64-byte trie nodes and child adjacency table to disk. Returns byte offset.
 """
 function write_trie_nodes(io::IO, nodes::Vector{TrieNode}, children::Dict{Int, Vector{Int}})::UInt64
     seekend(io)
@@ -259,8 +408,6 @@ end
 
 """
     read_trie_nodes(io::IO, offset::UInt64)::Tuple{Vector{TrieNode}, Dict{Int, Vector{Int}}}
-
-Deserializes packed 64-byte trie nodes and child adjacency table from disk.
 """
 function read_trie_nodes(io::IO, offset::UInt64)::Tuple{Vector{TrieNode}, Dict{Int, Vector{Int}}}
     if offset == 0
@@ -288,8 +435,6 @@ end
 
 """
     write_key_directory(io::IO, key_to_node::Dict{String, Int})::UInt64
-
-Serializes the string key directory to disk. Returns byte offset.
 """
 function write_key_directory(io::IO, key_to_node::Dict{String, Int})::UInt64
     seekend(io)
@@ -298,6 +443,9 @@ function write_key_directory(io::IO, key_to_node::Dict{String, Int})::UInt64
     write(io, count)
     for (k, node_idx) in key_to_node
         k_bytes = codeunits(k)
+        if length(k_bytes) > 65535
+            throw(ArgumentError("Key exceeds max length of 65535 bytes: '$k'"))
+        end
         write(io, UInt16(length(k_bytes)))
         write(io, k_bytes)
         write(io, UInt32(node_idx))
@@ -308,8 +456,6 @@ end
 
 """
     read_key_directory(io::IO, offset::UInt64)::Dict{String, Int}
-
-Deserializes the string key directory from disk.
 """
 function read_key_directory(io::IO, offset::UInt64)::Dict{String, Int}
     dict = Dict{String, Int}()

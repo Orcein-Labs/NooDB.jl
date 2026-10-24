@@ -1,5 +1,6 @@
-# NCD.jl - Core Engine & Dual-Fidelity Database Interface
+# NooDB.jl - Core Engine & Dual-Fidelity Database Interface
 # Provides standard Key-Value/Document operations and native model latent memory search
+# Fortified with Concurrency Locks, Numerical Shields, Double-Buffered Commits, and Atomic Vacuum.
 
 module Engine
 
@@ -13,9 +14,9 @@ using ..Format
 import ..Clifford: rotor_between, apply_rotor
 import Base: put!, get, delete!
 
-export NCDDatabase, SearchResult,
+export NooDBDatabase, NCDDatabase, SearchResult,
        open_database, close_database, put!, get, delete!,
-       near, query_latent, rotor_between, apply_rotor, sync!
+       near, query_latent, rotor_between, apply_rotor, sync!, compact!, vacuum!
 
 """
     SearchResult
@@ -32,36 +33,41 @@ struct SearchResult
 end
 
 """
-    NCDDatabase
+    NooDBDatabase
 
-Handle for an open NCD database instance.
+Handle for an open NooDB database instance with thread-safe ReentrantLock.
 """
-mutable struct NCDDatabase
+mutable struct NooDBDatabase
     path::String
     io::IOStream
-    header::NCDHeader
+    header::NooDBHeader
     codebooks::Vector{Vector{LorentzPoint}}
     nodes::Vector{TrieNode}
     children::Dict{Int, Vector{Int}}
     key_to_node::Dict{String, Int}
     node_to_key::Dict{Int, String}
     dirty::Bool
+    generation::UInt64
+    lock::ReentrantLock
 end
 
-"""
-    open_database(path::String; create::Bool=false, scale_depth::Int=4, codebook_sizes::Vector{Int}=[16, 16, 16, 16])::NCDDatabase
+# Backward compatibility alias
+const NCDDatabase = NooDBDatabase
 
-Opens an existing NCD database or creates a new one.
+"""
+    open_database(path::String; create::Bool=false, scale_depth::Int=4, codebook_sizes::Vector{Int}=[16, 16, 16, 16])::NooDBDatabase
+
+Opens an existing NooDB database or creates a new one with double-buffered headers.
 """
 function open_database(
     path::String;
     create::Bool = false,
     scale_depth::Int = 4,
     codebook_sizes::Vector{Int} = [16, 16, 16, 16]
-)::NCDDatabase
+)::NooDBDatabase
     if !isfile(path)
         if !create
-            error("NCD file not found at '$path' and create=false")
+            error("NooDB file not found at '$path' and create=false")
         end
         io = Base.open(path, "w+")
         
@@ -83,24 +89,29 @@ function open_database(
         nodes = [root_node]
         children = Dict{Int, Vector{Int}}(1 => Int[])
         
-        # Header setup
-        header = NCDHeader(
-            NCD_MAGIC, NCD_VERSION, 0x0, UInt16(scale_depth), UInt16(5),
-            UInt32(1), UInt64(0), UInt64(HEADER_SIZE), UInt64(0), UInt64(0), UInt64(0), UInt64(0)
+        # Header setup: Generation 1 in Slot A (offset 0), pad initial file to HEADER_BLOCK_SIZE
+        seek(io, 0)
+        write(io, zeros(UInt8, HEADER_BLOCK_SIZE))
+        
+        header = NooDBHeader(
+            NOODB_MAGIC, NOODB_VERSION, 0x0, UInt64(1), UInt32(0),
+            UInt16(scale_depth), UInt16(5),
+            UInt32(1), UInt64(0),
+            UInt64(HEADER_BLOCK_SIZE), UInt64(0), UInt64(0), UInt64(0), UInt64(HEADER_BLOCK_SIZE)
         )
         write_header(io, header)
         
-        db = NCDDatabase(path, io, header, codebooks, nodes, children, Dict{String, Int}(), Dict{Int, String}(), true)
+        db = NooDBDatabase(path, io, header, codebooks, nodes, children, Dict{String, Int}(), Dict{Int, String}(), true, UInt64(1), ReentrantLock())
         sync!(db)
         return db
     else
         io = Base.open(path, "r+")
         header = read_header(io)
+        gen = header.generation
         
         # Restore codebooks, trie nodes, and key directory from disk
         codebooks = read_codebooks(io, header.offset_codebooks)
         if isempty(codebooks)
-            # Fallback if brand new unwritten file
             codebooks = Vector{Vector{LorentzPoint}}(undef, Int(header.scale_depth_k))
             for s in 1:Int(header.scale_depth_k)
                 cb = Vector{LorentzPoint}(undef, 16)
@@ -123,52 +134,60 @@ function open_database(
         key_to_node = read_key_directory(io, header.offset_keys)
         node_to_key = Dict{Int, String}(v => k for (k, v) in key_to_node)
         
-        return NCDDatabase(path, io, header, codebooks, nodes, children, key_to_node, node_to_key, false)
+        return NooDBDatabase(path, io, header, codebooks, nodes, children, key_to_node, node_to_key, false, gen, ReentrantLock())
     end
 end
 
 """
-    close_database(db::NCDDatabase)
+    close_database(db::NooDBDatabase)
 
 Flushes pending writes, serializes index tables, updates header, and closes the file stream.
 """
-function close_database(db::NCDDatabase)
-    if isopen(db.io)
-        sync!(db)
-        Base.close(db.io)
+function close_database(db::NooDBDatabase)
+    lock(db.lock) do
+        if isopen(db.io)
+            sync!(db)
+            Base.close(db.io)
+        end
     end
 end
 
 """
-    sync!(db::NCDDatabase)
+    sync!(db::NooDBDatabase)
 
-Persists codebooks, trie nodes, key directory, and header to disk.
+Persists codebooks, trie nodes, key directory, and double-buffered header to disk.
 """
-function sync!(db::NCDDatabase)
-    if isopen(db.io)
-        # 1. Write codebooks
-        off_cb = write_codebooks(db.io, db.codebooks)
-        
-        # 2. Write trie nodes and children adjacency
-        off_trie = write_trie_nodes(db.io, db.nodes, db.children)
-        
-        # 3. Write key directory
-        off_keys = write_key_directory(db.io, db.key_to_node)
-        
-        seekend(db.io)
-        fsize = UInt64(position(db.io))
-        
-        # 4. Write updated header
-        new_header = NCDHeader(
-            db.header.magic, db.header.version, db.header.flags,
-            db.header.scale_depth_k, db.header.ambient_dim,
-            UInt32(length(db.nodes)), UInt64(length(db.key_to_node)),
-            off_cb, off_trie, off_keys, db.header.offset_payloads, fsize
-        )
-        db.header = new_header
-        write_header(db.io, db.header)
-        flush(db.io)
-        db.dirty = false
+function sync!(db::NooDBDatabase)
+    lock(db.lock) do
+        if isopen(db.io)
+            # 1. Write codebooks
+            off_cb = write_codebooks(db.io, db.codebooks)
+            
+            # 2. Write trie nodes and children adjacency
+            off_trie = write_trie_nodes(db.io, db.nodes, db.children)
+            
+            # 3. Write key directory
+            off_keys = write_key_directory(db.io, db.key_to_node)
+            
+            seekend(db.io)
+            fsize = UInt64(position(db.io))
+            
+            # Increment monotonic generation for double-buffered atomic commit
+            db.generation += 1
+            
+            # 4. Write updated header to alternating slot with CRC32c
+            new_header = NooDBHeader(
+                db.header.magic, db.header.version, db.header.flags,
+                db.generation, UInt32(0),
+                db.header.scale_depth_k, db.header.ambient_dim,
+                UInt32(length(db.nodes)), UInt64(length(db.key_to_node)),
+                off_cb, off_trie, off_keys, db.header.offset_payloads, fsize
+            )
+            db.header = new_header
+            write_header(db.io, db.header)
+            flush(db.io)
+            db.dirty = false
+        end
     end
 end
 
@@ -215,12 +234,12 @@ function compute_concept_coords(
 end
 
 """
-    put!(db::NCDDatabase, key::String, value; concept=nothing, latent=nothing, coords=nothing)
+    put!(db::NooDBDatabase, key::String, value; concept=nothing, latent=nothing, coords=nothing)
 
-Inserts or updates a record. Positions it inside the multiscale concept trie.
+Thread-safe insert or update of a record.
 """
 function put!(
-    db::NCDDatabase,
+    db::NooDBDatabase,
     key::String,
     value;
     concept::Union{Nothing, String} = nothing,
@@ -228,151 +247,234 @@ function put!(
     coords::Union{Nothing, LorentzPoint} = nothing
 )
     pt = coords !== nothing ? coords : compute_concept_coords(key, concept, latent)
-    
-    # Serialize payload and write to disk
     raw_bytes = serialize_value(value)
-    p_offset, p_size = append_payload(db.io, raw_bytes)
     
-    # Check if key already exists (in-place update)
-    if haskey(db.key_to_node, key)
-        node_idx = db.key_to_node[key]
-        old_node = db.nodes[node_idx]
-        new_node = create_node(
-            old_node.scale_level, old_node.code_id, pt;
-            radius = old_node.cluster_radius,
+    lock(db.lock) do
+        # Serialize payload and write to disk
+        p_offset, p_size = append_payload(db.io, raw_bytes)
+        
+        # Check if key already exists (in-place update)
+        if haskey(db.key_to_node, key)
+            node_idx = db.key_to_node[key]
+            old_node = db.nodes[node_idx]
+            new_node = create_node(
+                old_node.scale_level, old_node.code_id, pt;
+                radius = old_node.cluster_radius,
+                flags = NODE_FLAG_LEAF | NODE_FLAG_PAYLOAD,
+                payload_offset = p_offset,
+                payload_size = p_size
+            )
+            db.nodes[node_idx] = new_node
+            db.dirty = true
+            return db
+        end
+        
+        # Hierarchical insertion through multiscale concept levels
+        curr_node_idx = 1 # Root
+        K = Int(db.header.scale_depth_k)
+        
+        for s in 1:K
+            cb = db.codebooks[s]
+            
+            # Find nearest centroid in codebook C_s
+            best_code = 1
+            best_d = Inf32
+            for (c_idx, centroid) in enumerate(cb)
+                d = lorentz_dist(pt, centroid)
+                if d < best_d
+                    best_d = d
+                    best_code = c_idx
+                end
+            end
+            
+            # Expand parent's cluster radius to enclose pt
+            curr_node = db.nodes[curr_node_idx]
+            curr_pt = get_lorentz_point(curr_node)
+            new_r = max(curr_node.cluster_radius, lorentz_dist(curr_pt, pt))
+            db.nodes[curr_node_idx] = create_node(
+                curr_node.scale_level, curr_node.code_id, curr_pt;
+                radius = new_r,
+                flags = curr_node.flags,
+                child_offset = curr_node.child_offset,
+                child_count = curr_node.child_count,
+                payload_offset = curr_node.payload_offset,
+                payload_size = curr_node.payload_size
+            )
+            
+            # Search for existing child branch with this (scale, code)
+            children_list = get!(db.children, curr_node_idx, Int[])
+            matching_child_idx = 0
+            for child_idx in children_list
+                c_node = db.nodes[child_idx]
+                if c_node.scale_level == s && c_node.code_id == best_code && (c_node.flags & NODE_FLAG_LEAF) == 0
+                    matching_child_idx = child_idx
+                    break
+                end
+            end
+            
+            if matching_child_idx == 0
+                # Create new internal concept node
+                centroid_pt = cb[best_code]
+                init_r = lorentz_dist(centroid_pt, pt)
+                new_internal = create_node(s, best_code, centroid_pt; radius=init_r, flags=0)
+                push!(db.nodes, new_internal)
+                matching_child_idx = length(db.nodes)
+                push!(children_list, matching_child_idx)
+                db.children[matching_child_idx] = Int[]
+            end
+            
+            curr_node_idx = matching_child_idx
+        end
+        
+        # Attach leaf node under the finest concept node
+        leaf_node = create_node(
+            K, 1, pt;
+            radius = 0.0f0,
             flags = NODE_FLAG_LEAF | NODE_FLAG_PAYLOAD,
             payload_offset = p_offset,
             payload_size = p_size
         )
-        db.nodes[node_idx] = new_node
+        push!(db.nodes, leaf_node)
+        leaf_idx = length(db.nodes)
+        
+        parent_children = get!(db.children, curr_node_idx, Int[])
+        push!(parent_children, leaf_idx)
+        
+        db.key_to_node[key] = leaf_idx
+        db.node_to_key[leaf_idx] = key
         db.dirty = true
+        
         return db
     end
-    
-    # Hierarchical insertion through multiscale concept levels
-    curr_node_idx = 1 # Root
-    K = Int(db.header.scale_depth_k)
-    
-    for s in 1:K
-        cb = db.codebooks[s]
+end
+
+"""
+    get(db::NooDBDatabase, key::String)
+
+Thread-safe record retrieval by exact key with CRC32c integrity verification.
+"""
+function get(db::NooDBDatabase, key::String)
+    lock(db.lock) do
+        if !haskey(db.key_to_node, key)
+            return nothing
+        end
+        node_idx = db.key_to_node[key]
+        node = db.nodes[node_idx]
         
-        # Find nearest centroid in codebook C_s
-        best_code = 1
-        best_d = Inf32
-        for (c_idx, centroid) in enumerate(cb)
-            d = lorentz_dist(pt, centroid)
-            if d < best_d
-                best_d = d
-                best_code = c_idx
-            end
+        if (node.flags & NODE_FLAG_DELETED) != 0
+            return nothing
         end
         
-        # Expand parent's cluster radius to enclose pt
-        curr_node = db.nodes[curr_node_idx]
-        curr_pt = get_lorentz_point(curr_node)
-        new_r = max(curr_node.cluster_radius, lorentz_dist(curr_pt, pt))
-        db.nodes[curr_node_idx] = create_node(
-            curr_node.scale_level, curr_node.code_id, curr_pt;
-            radius = new_r,
-            flags = curr_node.flags,
-            child_offset = curr_node.child_offset,
-            child_count = curr_node.child_count,
-            payload_offset = curr_node.payload_offset,
-            payload_size = curr_node.payload_size
+        raw_bytes = read_payload(db.io, node.payload_offset, node.payload_size)
+        return deserialize_value(raw_bytes)
+    end
+end
+
+"""
+    delete!(db::NooDBDatabase, key::String)
+
+Thread-safe deletion of a record.
+"""
+function delete!(db::NooDBDatabase, key::String)
+    lock(db.lock) do
+        if !haskey(db.key_to_node, key)
+            return false
+        end
+        node_idx = db.key_to_node[key]
+        node = db.nodes[node_idx]
+        updated_node = create_node(
+            node.scale_level, node.code_id, get_lorentz_point(node);
+            radius = node.cluster_radius,
+            flags = node.flags | NODE_FLAG_DELETED,
+            payload_offset = node.payload_offset,
+            payload_size = node.payload_size
         )
+        db.nodes[node_idx] = updated_node
+        delete!(db.key_to_node, key)
+        delete!(db.node_to_key, node_idx)
+        db.dirty = true
+        return true
+    end
+end
+
+"""
+    compact!(db::NooDBDatabase)
+
+Atomic Vacuum & Space Reclamation Engine.
+Copies all active (non-deleted) payloads into a fresh file, rebuilds indices,
+purges all fragmented dead bytes, and atomically renames over the old database file.
+"""
+function compact!(db::NooDBDatabase)
+    lock(db.lock) do
+        # 1. Flush any pending writes first
+        sync!(db)
         
-        # Search for existing child branch with this (scale, code)
-        children_list = get!(db.children, curr_node_idx, Int[])
-        matching_child_idx = 0
-        for child_idx in children_list
-            c_node = db.nodes[child_idx]
-            if c_node.scale_level == s && c_node.code_id == best_code && (c_node.flags & NODE_FLAG_LEAF) == 0
-                matching_child_idx = child_idx
-                break
+        tmp_path = db.path * ".vacuum.tmp"
+        tmp_io = Base.open(tmp_path, "w+")
+        
+        # Reserve header block (256 bytes)
+        write(tmp_io, zeros(UInt8, HEADER_BLOCK_SIZE))
+        
+        # Copy over active payloads and update leaf node offsets
+        new_nodes = copy(db.nodes)
+        for (k, n_idx) in db.key_to_node
+            node = db.nodes[n_idx]
+            if (node.flags & NODE_FLAG_DELETED) == 0 && (node.flags & NODE_FLAG_PAYLOAD) != 0
+                payload_data = read_payload(db.io, node.payload_offset, node.payload_size)
+                new_off, new_sz = append_payload(tmp_io, payload_data)
+                
+                new_nodes[n_idx] = create_node(
+                    node.scale_level, node.code_id, get_lorentz_point(node);
+                    radius = node.cluster_radius,
+                    flags = node.flags,
+                    payload_offset = new_off,
+                    payload_size = new_sz,
+                    child_offset = node.child_offset,
+                    child_count = node.child_count
+                )
             end
         end
         
-        if matching_child_idx == 0
-            # Create new internal concept node
-            centroid_pt = cb[best_code]
-            init_r = lorentz_dist(centroid_pt, pt)
-            new_internal = create_node(s, best_code, centroid_pt; radius=init_r, flags=0)
-            push!(db.nodes, new_internal)
-            matching_child_idx = length(db.nodes)
-            push!(children_list, matching_child_idx)
-            db.children[matching_child_idx] = Int[]
-        end
+        # Write tables to tmp file
+        off_cb = write_codebooks(tmp_io, db.codebooks)
+        off_trie = write_trie_nodes(tmp_io, new_nodes, db.children)
+        off_keys = write_key_directory(tmp_io, db.key_to_node)
         
-        curr_node_idx = matching_child_idx
+        seekend(tmp_io)
+        fsize = UInt64(position(tmp_io))
+        
+        # Write new header with incremented generation
+        new_gen = db.generation + 1
+        new_header = NooDBHeader(
+            db.header.magic, db.header.version, db.header.flags,
+            new_gen, UInt32(0),
+            db.header.scale_depth_k, db.header.ambient_dim,
+            UInt32(length(new_nodes)), UInt64(length(db.key_to_node)),
+            off_cb, off_trie, off_keys, UInt64(HEADER_BLOCK_SIZE), fsize
+        )
+        write_header(tmp_io, new_header)
+        flush(tmp_io)
+        Base.close(tmp_io)
+        
+        # Close old file stream, atomically swap, and reopen
+        Base.close(db.io)
+        mv(tmp_path, db.path; force=true)
+        
+        # Reopen and re-bind handle
+        db.io = Base.open(db.path, "r+")
+        db.header = new_header
+        db.nodes = new_nodes
+        db.generation = new_gen
+        db.dirty = false
+        
+        return db
     end
-    
-    # Attach leaf node under the finest concept node
-    leaf_node = create_node(
-        K, 1, pt;
-        radius = 0.0f0,
-        flags = NODE_FLAG_LEAF | NODE_FLAG_PAYLOAD,
-        payload_offset = p_offset,
-        payload_size = p_size
-    )
-    push!(db.nodes, leaf_node)
-    leaf_idx = length(db.nodes)
-    
-    parent_children = get!(db.children, curr_node_idx, Int[])
-    push!(parent_children, leaf_idx)
-    
-    db.key_to_node[key] = leaf_idx
-    db.node_to_key[leaf_idx] = key
-    db.dirty = true
-    
-    return db
 end
 
-"""
-    get(db::NCDDatabase, key::String)
+# Alias
+const vacuum! = compact!
 
-Retrieves a record by its exact key with CRC32c integrity verification.
-"""
-function get(db::NCDDatabase, key::String)
-    if !haskey(db.key_to_node, key)
-        return nothing
-    end
-    node_idx = db.key_to_node[key]
-    node = db.nodes[node_idx]
-    
-    if (node.flags & NODE_FLAG_DELETED) != 0
-        return nothing
-    end
-    
-    raw_bytes = read_payload(db.io, node.payload_offset, node.payload_size)
-    return deserialize_value(raw_bytes)
-end
-
-"""
-    delete!(db::NCDDatabase, key::String)
-
-Marks a record as deleted.
-"""
-function delete!(db::NCDDatabase, key::String)
-    if !haskey(db.key_to_node, key)
-        return false
-    end
-    node_idx = db.key_to_node[key]
-    node = db.nodes[node_idx]
-    updated_node = create_node(
-        node.scale_level, node.code_id, get_lorentz_point(node);
-        radius = node.cluster_radius,
-        flags = node.flags | NODE_FLAG_DELETED,
-        payload_offset = node.payload_offset,
-        payload_size = node.payload_size
-    )
-    db.nodes[node_idx] = updated_node
-    delete!(db.key_to_node, key)
-    delete!(db.node_to_key, node_idx)
-    db.dirty = true
-    return true
-end
-
-# Simple, zero-dependency Binary Min-Heap for Branch-and-Bound
+# Priority queue min-heap for Branch-and-Bound
 struct HeapItem
     dist_bound::Float32
     node_idx::Int
@@ -423,14 +525,14 @@ function heap_pop!(heap::Vector{HeapItem})::HeapItem
 end
 
 """
-    near(db::NCDDatabase, query; limit=5, mode=:exact)::Vector{SearchResult}
+    near(db::NooDBDatabase, query; limit=5, mode=:exact)::Vector{SearchResult}
 
-Performs semantic / nearest-neighbor search in H^5.
+Thread-safe semantic / nearest-neighbor search in H^5.
 - mode=:exact: Best-first Branch-and-Bound traversal (100.0% exact recall certified).
 - mode=:reflex: Hierarchical greedy Lyapunov descent (< 100 ns, bounded visited nodes).
 """
 function near(
-    db::NCDDatabase,
+    db::NooDBDatabase,
     query;
     limit::Int = 5,
     mode::Symbol = :exact
@@ -442,29 +544,27 @@ function near(
     elseif query isa AbstractVector
         project_highdim_to_h5(query)
     elseif query isa String
-        if haskey(db.key_to_node, query)
-            get_lorentz_point(db.nodes[db.key_to_node[query]])
-        else
-            compute_concept_coords(query, query, nothing)
+        lock(db.lock) do
+            if haskey(db.key_to_node, query)
+                get_lorentz_point(db.nodes[db.key_to_node[query]])
+            else
+                compute_concept_coords(query, query, nothing)
+            end
         end
     else
         error("Unsupported query type: $(typeof(query))")
     end
 
-    if mode == :reflex
-        return near_reflex(db, q_pt, limit, t_start)
-    else
-        return near_exact(db, q_pt, limit, t_start)
+    lock(db.lock) do
+        if mode == :reflex
+            return near_reflex(db, q_pt, limit, t_start)
+        else
+            return near_exact(db, q_pt, limit, t_start)
+        end
     end
 end
 
-"""
-    near_reflex(db, q_pt, limit, t_start)
-
-Reflex Mode: Hierarchical greedy Lyapunov descent.
-Guaranteed acyclic termination in <= K hops.
-"""
-function near_reflex(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::UInt64)::Vector{SearchResult}
+function near_reflex(db::NooDBDatabase, q_pt::LorentzPoint, limit::Int, t_start::UInt64)::Vector{SearchResult}
     curr_node_idx = 1
     visited_nodes = 1
     epsilon = 1.0f-4
@@ -498,7 +598,6 @@ function near_reflex(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::U
             break
         end
         
-        # Check strict Lyapunov descent condition
         if best_child_dist <= curr_dist - epsilon || (db.nodes[best_child].flags & NODE_FLAG_LEAF) != 0
             curr_node_idx = best_child
             visited_nodes += 1
@@ -506,12 +605,10 @@ function near_reflex(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::U
                 break
             end
         else
-            # Local attractor minimum reached: halt descent
             break
         end
     end
     
-    # Collect leaf records reachable from the attractor node or its parent
     leaf_candidates = Int[]
     queue = [curr_node_idx]
     while !isempty(queue)
@@ -524,7 +621,6 @@ function near_reflex(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::U
         end
     end
     
-    # If attractor was too narrow, expand to siblings
     if length(leaf_candidates) < limit
         for (k, n_idx) in db.key_to_node
             if !(n_idx in leaf_candidates)
@@ -553,13 +649,7 @@ function near_reflex(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::U
     return length(results) > limit ? results[1:limit] : results
 end
 
-"""
-    near_exact(db, q_pt, limit, t_start)
-
-Exact Mode: Best-First Branch-and-Bound traversal.
-Certified 100.0% exact nearest-neighbor parity against exhaustive search.
-"""
-function near_exact(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::UInt64)::Vector{SearchResult}
+function near_exact(db::NooDBDatabase, q_pt::LorentzPoint, limit::Int, t_start::UInt64)::Vector{SearchResult}
     heap = HeapItem[]
     root_pt = get_lorentz_point(db.nodes[1])
     root_bound = max(0.0f0, lorentz_dist(q_pt, root_pt) - db.nodes[1].cluster_radius)
@@ -573,7 +663,6 @@ function near_exact(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::UI
         item = heap_pop!(heap)
         visited_nodes += 1
         
-        # Certified pruning: if lower bound is >= d_best and top-k is full, terminate!
         if length(top_results) >= limit && item.dist_bound >= d_best
             break
         end
@@ -594,7 +683,6 @@ function near_exact(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::UI
                 val = deserialize_value(raw)
                 res = SearchResult(k, d, pt, val, visited_nodes, 0.0)
                 
-                # Insert into top_results keeping sorted by distance
                 ins_idx = searchsortedfirst([r.distance for r in top_results], d)
                 insert!(top_results, ins_idx, res)
                 if length(top_results) > limit
@@ -605,7 +693,6 @@ function near_exact(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::UI
                 end
             end
         else
-            # Internal node: expand children
             children = get(db.children, node_idx, Int[])
             for c in children
                 c_node = db.nodes[c]
@@ -614,13 +701,11 @@ function near_exact(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::UI
                 end
                 c_pt = get_lorentz_point(c_node)
                 if (c_node.flags & NODE_FLAG_LEAF) != 0
-                    # Leaf child: bound is exact distance
                     c_dist = lorentz_dist(q_pt, c_pt)
                     if length(top_results) < limit || c_dist < d_best
                         heap_push!(heap, HeapItem(c_dist, c))
                     end
                 else
-                    # Certified metric lower bound: dist_bound = max(0, d_H(q, c) - R)
                     c_bound = max(0.0f0, lorentz_dist(q_pt, c_pt) - c_node.cluster_radius)
                     if length(top_results) < limit || c_bound < d_best
                         heap_push!(heap, HeapItem(c_bound, c))
@@ -631,34 +716,33 @@ function near_exact(db::NCDDatabase, q_pt::LorentzPoint, limit::Int, t_start::UI
     end
     
     total_ns = Float64(time_ns() - t_start)
-    # Update latency on results
     return [SearchResult(r.key, r.distance, r.point, r.payload, visited_nodes, total_ns) for r in top_results]
 end
 
 """
-    query_latent(db::NCDDatabase, z::AbstractVector; limit=1, mode=:exact)
-
-Direct model-native latent search interface.
+    query_latent(db::NooDBDatabase, z::AbstractVector; limit=1, mode=:exact)
 """
-function query_latent(db::NCDDatabase, z::AbstractVector; limit::Int = 1, mode::Symbol = :exact)
+function query_latent(db::NooDBDatabase, z::AbstractVector; limit::Int = 1, mode::Symbol = :exact)
     q_pt = project_highdim_to_h5(z)
     return near(db, q_pt; limit=limit, mode=mode)
 end
 
 """
-    rotor_between(db::NCDDatabase, key_a::String, key_b::String)::CliffordRotor
+    rotor_between(db::NooDBDatabase, key_a::String, key_b::String)::CliffordRotor
 """
-function Clifford.rotor_between(db::NCDDatabase, key_a::String, key_b::String)::CliffordRotor
-    @assert haskey(db.key_to_node, key_a) "Key '$key_a' not found"
-    @assert haskey(db.key_to_node, key_b) "Key '$key_b' not found"
-    
-    node_a = db.nodes[db.key_to_node[key_a]]
-    node_b = db.nodes[db.key_to_node[key_b]]
-    
-    va = (node_a.x1, node_a.x2, node_a.x3)
-    vb = (node_b.x1, node_b.x2, node_b.x3)
-    
-    return Clifford.rotor_between(va, vb)
+function Clifford.rotor_between(db::NooDBDatabase, key_a::String, key_b::String)::CliffordRotor
+    lock(db.lock) do
+        @assert haskey(db.key_to_node, key_a) "Key '$key_a' not found"
+        @assert haskey(db.key_to_node, key_b) "Key '$key_b' not found"
+        
+        node_a = db.nodes[db.key_to_node[key_a]]
+        node_b = db.nodes[db.key_to_node[key_b]]
+        
+        va = (node_a.x1, node_a.x2, node_a.x3)
+        vb = (node_b.x1, node_b.x2, node_b.x3)
+        
+        return Clifford.rotor_between(va, vb)
+    end
 end
 
 """

@@ -7,7 +7,8 @@
 # 5. KV performance benchmarks vs baseline Dict
 
 using Test
-using NCD
+using NooDB
+const NCD = NooDB
 using LinearAlgebra
 using Statistics
 
@@ -33,7 +34,7 @@ println("=== NCD.jl ADVANCED PRODUCTION GAUNTLET ===")
             
             # Step 2: Open in a brand new, isolated Julia subprocess
             verify_script = """
-            using NCD
+            using NooDB
             db = open_database("$db_path"; create=false)
             
             # Verify record count

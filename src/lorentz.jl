@@ -1,5 +1,6 @@
-# NCD.jl - Lorentz Hyperbolic Geometry Module
+# NooDB.jl - Lorentz Hyperbolic Geometry Module
 # Implements 5D Lorentz (hyperboloid) geometry embedded in Minkowski space R^(5+1)
+# Fortified against numerical singularities, NaNs, Infs, and coordinate overflows.
 
 module Lorentz
 
@@ -25,27 +26,42 @@ struct LorentzPoint
     x5::Float32
 
     function LorentzPoint(x0::Real, x1::Real, x2::Real, x3::Real, x4::Real, x5::Real)
-        new(Float32(x0), Float32(x1), Float32(x2), Float32(x3), Float32(x4), Float32(x5))
+        f0, f1, f2, f3, f4, f5 = Float32(x0), Float32(x1), Float32(x2), Float32(x3), Float32(x4), Float32(x5)
+        if !isfinite(f0) || !isfinite(f1) || !isfinite(f2) || !isfinite(f3) || !isfinite(f4) || !isfinite(f5)
+            throw(ArgumentError("LorentzPoint coordinates must be finite numbers (received NaN or Inf)"))
+        end
+        new(f0, f1, f2, f3, f4, f5)
     end
 end
 
 """
     LorentzPoint(spatial::NTuple{5, Real})
 
-Constructs a LorentzPoint from 5 spatial coordinates by reconstructing x0:
+Constructs a LorentzPoint from 5 spatial coordinates with overflow clamping and finite validation:
 x0 = sqrt(1 + sum(spatial.^2))
 """
 function LorentzPoint(spatial::NTuple{5, Real})
-    s_sq = Float32(spatial[1]^2 + spatial[2]^2 + spatial[3]^2 + spatial[4]^2 + spatial[5]^2)
+    for i in 1:5
+        if !isfinite(spatial[i])
+            throw(ArgumentError("Spatial coordinate $i is not finite: $(spatial[i])"))
+        end
+    end
+    # Clamp coordinates to prevent squared overflow in Float32 (max_float32 / 5 ≈ 6.8e37, sqrt ≈ 8.2e18)
+    c1 = clamp(Float32(spatial[1]), -1.0f18, 1.0f18)
+    c2 = clamp(Float32(spatial[2]), -1.0f18, 1.0f18)
+    c3 = clamp(Float32(spatial[3]), -1.0f18, 1.0f18)
+    c4 = clamp(Float32(spatial[4]), -1.0f18, 1.0f18)
+    c5 = clamp(Float32(spatial[5]), -1.0f18, 1.0f18)
+    s_sq = c1^2 + c2^2 + c3^2 + c4^2 + c5^2
     x0 = sqrt(1.0f0 + s_sq)
-    return LorentzPoint(x0, spatial[1], spatial[2], spatial[3], spatial[4], spatial[5])
+    return LorentzPoint(x0, c1, c2, c3, c4, c5)
 end
 
 function LorentzPoint(spatial::AbstractVector{<:Real})
-    @assert length(spatial) == 5 "Spatial coordinates must have dimension 5"
-    s_sq = Float32(spatial[1]^2 + spatial[2]^2 + spatial[3]^2 + spatial[4]^2 + spatial[5]^2)
-    x0 = sqrt(1.0f0 + s_sq)
-    return LorentzPoint(x0, spatial[1], spatial[2], spatial[3], spatial[4], spatial[5])
+    if length(spatial) != 5
+        throw(ArgumentError("Spatial coordinates must have dimension 5 (got $(length(spatial)))"))
+    end
+    return LorentzPoint((spatial[1], spatial[2], spatial[3], spatial[4], spatial[5]))
 end
 
 """
@@ -54,7 +70,12 @@ end
 Reconstructs x0 from 5 spatial coordinates.
 """
 @inline function reconstruct_x0(spatial::NTuple{5, Float32})::Float32
-    s_sq = spatial[1]^2 + spatial[2]^2 + spatial[3]^2 + spatial[4]^2 + spatial[5]^2
+    c1 = clamp(spatial[1], -1.0f18, 1.0f18)
+    c2 = clamp(spatial[2], -1.0f18, 1.0f18)
+    c3 = clamp(spatial[3], -1.0f18, 1.0f18)
+    c4 = clamp(spatial[4], -1.0f18, 1.0f18)
+    c5 = clamp(spatial[5], -1.0f18, 1.0f18)
+    s_sq = c1^2 + c2^2 + c3^2 + c4^2 + c5^2
     return sqrt(1.0f0 + s_sq)
 end
 
@@ -65,7 +86,7 @@ Computes the Minkowski quadratic form <p, p>_L = -x0^2 + sum(x_sp.^2).
 For any valid point on the hyperboloid, this equals -1.0 within numerical precision.
 """
 @inline function lorentz_norm_sq(p::LorentzPoint)::Float32
-    return -p.x0^2 + p.x1^2 + p.x2^2 + p.x3^2 + p.x4^2 + p.x5^2
+    return -p.x0^2 + (p.x1^2 + p.x2^2 + p.x3^2 + p.x4^2 + p.x5^2)
 end
 
 """
@@ -82,13 +103,19 @@ end
 """
     lorentz_dist(p::LorentzPoint, q::LorentzPoint)::Float32
 
-Computes the exact geodesic distance on H^5:
+Computes the exact geodesic distance on H^5 with singularity defense:
 d_H(p, q) = arcosh(max(1.0, -<p, q>_L))
+Guaranteed to never return NaN or throw DomainError.
 """
 @inline function lorentz_dist(p::LorentzPoint, q::LorentzPoint)::Float32
     neg_inner = -lorentz_inner(p, q)
-    u = max(1.0f0, neg_inner)
-    return acosh(u)
+    if isnan(neg_inner) || neg_inner <= 1.0f0
+        return 0.0f0
+    elseif isinf(neg_inner)
+        return 100.0f0
+    end
+    # acosh is certified safe for u >= 1.0f0
+    return acosh(neg_inner)
 end
 
 """
@@ -115,8 +142,10 @@ end
 Projects an arbitrary vector in R^5 onto H^5.
 """
 function project_to_hyperboloid(raw::AbstractVector{<:Real})::LorentzPoint
-    @assert length(raw) >= 5 "Input vector must have at least 5 dimensions"
-    return LorentzPoint(raw[1:5])
+    if length(raw) < 5
+        throw(ArgumentError("Input vector must have at least 5 dimensions (got $(length(raw)))"))
+    end
+    return LorentzPoint((raw[1], raw[2], raw[3], raw[4], raw[5]))
 end
 
 """
@@ -131,7 +160,13 @@ function project_highdim_to_h5(v::AbstractVector{<:Real}; seed::Integer = 0x1234
         return project_to_hyperboloid(v)
     end
     
-    # Deterministic linear projection down to 5 spatial dims
+    # Check for NaN / Inf in input vector
+    for (idx, val) in enumerate(v)
+        if !isfinite(val)
+            throw(ArgumentError("Input vector contains non-finite element at index $idx: $val"))
+        end
+    end
+    
     out = zeros(Float32, 5)
     scale = 1.0f0 / sqrt(Float32(d_in))
     
@@ -139,7 +174,7 @@ function project_highdim_to_h5(v::AbstractVector{<:Real}; seed::Integer = 0x1234
         acc = 0.0f0
         state = seed + UInt64(i * 10007)
         for j in 1:d_in
-            # Simple fast deterministic PRNG (xorshift64)
+            # Fast deterministic PRNG (xorshift64)
             state ⊻= state << 13
             state ⊻= state >> 7
             state ⊻= state << 17
