@@ -321,6 +321,20 @@ function put!(
                 matching_child_idx = length(db.nodes)
                 push!(children_list, matching_child_idx)
                 db.children[matching_child_idx] = Int[]
+            else
+                # Existing internal concept node: expand cluster radius to strictly enclose pt
+                c_node = db.nodes[matching_child_idx]
+                c_pt = get_lorentz_point(c_node)
+                expanded_r = max(c_node.cluster_radius, lorentz_dist(c_pt, pt))
+                db.nodes[matching_child_idx] = create_node(
+                    c_node.scale_level, c_node.code_id, c_pt;
+                    radius = expanded_r,
+                    flags = c_node.flags,
+                    child_offset = c_node.child_offset,
+                    child_count = c_node.child_count,
+                    payload_offset = c_node.payload_offset,
+                    payload_size = c_node.payload_size
+                )
             end
             
             curr_node_idx = matching_child_idx

@@ -108,6 +108,10 @@ d_H(p, q) = arcosh(max(1.0, -<p, q>_L))
 Guaranteed to never return NaN or throw DomainError.
 """
 @inline function lorentz_dist(p::LorentzPoint, q::LorentzPoint)::Float32
+    # Exact identity of indiscernibles: identical points have distance zero
+    if (p.x1 == q.x1) & (p.x2 == q.x2) & (p.x3 == q.x3) & (p.x4 == q.x4) & (p.x5 == q.x5)
+        return 0.0f0
+    end
     neg_inner = -lorentz_inner(p, q)
     if isnan(neg_inner) || neg_inner <= 1.0f0
         return 0.0f0

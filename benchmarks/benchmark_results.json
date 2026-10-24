@@ -1,0 +1,66 @@
+{
+  "timestamp": "2026-10-24T02:14:05Z",
+  "system": {
+    "os": "Linux",
+    "cpu": "x86_64",
+    "julia_version": "1.12.0-rc1"
+  },
+  "key_value_benchmarks": {
+    "records": 5000,
+    "noodb": {
+      "write_throughput_ops_per_sec": 36150.1,
+      "read_p50_us": 6.69,
+      "read_p95_us": 10.31,
+      "read_p99_us": 36.86,
+      "file_size_kb": 910.4
+    },
+    "sqlite_wal": {
+      "write_throughput_ops_per_sec": 279266.5,
+      "read_p50_us": 6.10,
+      "read_p95_us": 7.32,
+      "read_p99_us": 12.67,
+      "file_size_kb": 4.0
+    }
+  },
+  "vector_benchmarks": [
+    {
+      "n_records": 500,
+      "brute_force_us": 13.78,
+      "noodb_exact_bb_us": 2006.51,
+      "noodb_reflex_us": 624.25,
+      "pruned_ratio_pct": 63.2
+    },
+    {
+      "n_records": 1000,
+      "brute_force_us": 28.50,
+      "noodb_exact_bb_us": 164.76,
+      "noodb_reflex_us": 1533.28,
+      "pruned_ratio_pct": 79.7
+    },
+    {
+      "n_records": 2500,
+      "brute_force_us": 71.95,
+      "noodb_exact_bb_us": 498.98,
+      "noodb_reflex_us": 4466.65,
+      "pruned_ratio_pct": 90.9
+    },
+    {
+      "n_records": 5000,
+      "brute_force_us": 144.40,
+      "noodb_exact_bb_us": 756.98,
+      "noodb_reflex_us": 9085.56,
+      "pruned_ratio_pct": 95.1
+    }
+  ],
+  "storage_footprint_per_1m_embeddings": {
+    "pinecone_1536dim_bytes_per_vec": 6144,
+    "pinecone_1m_gb": 6.14,
+    "qdrant_768dim_bytes_per_vec": 3072,
+    "qdrant_1m_gb": 3.07,
+    "milvus_384dim_bytes_per_vec": 1536,
+    "milvus_1m_gb": 1.54,
+    "noodb_5d_bytes_per_vec": 20,
+    "noodb_1m_mb": 20.0,
+    "storage_reduction_pct": 99.6
+  }
+}
